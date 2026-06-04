@@ -1,0 +1,1580 @@
+import os
+import json
+import logging
+import uuid
+import base64
+import re
+import asyncio
+from collections import defaultdict, Counter
+from datetime import datetime
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+import aiohttp
+
+# ======================================================
+# LOGGING
+# ======================================================
+logger = logging.getLogger()
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+# ======================================================
+# LOAD ALL CONFIG FROM SINGLE ENV VARIABLE
+# ======================================================
+onetrust_config = json.loads(os.environ["Onetrust_Reference_Value"])
+
+AWS_REGION           = onetrust_config["AWS_REGION"]
+SECRET_NAME          = onetrust_config["SECRET_NAME"]
+TOKEN_URL            = onetrust_config["TOKEN_URL"]
+PROFILES_URL         = onetrust_config["PROFILES_URL"]
+CONSENT_URL          = onetrust_config["CONSENT_RECEIPTS_URL"]
+COLLECTION_POINT_URL = onetrust_config["COLLECTION_POINT_URL"]
+PURPOSE_TABLE        = onetrust_config["PURPOSE_TABLE"]
+PREFERENCE_TABLE     = onetrust_config["PREFERENCE_TABLE"]
+COUNTRY_TABLE        = onetrust_config["COUNTRY_TABLE"]
+REQUEST_TIMEOUT      = float(onetrust_config["REQUEST_TIMEOUT"])
+REQUESTS_CA_BUNDLE   = onetrust_config.get("REQUESTS_CA_BUNDLE", False)
+SQS_DLQ_URL          = onetrust_config["SQS_DLQ_URL"]
+
+# ======================================================
+# DEFAULT PURPOSE IDENTIFIERS — loaded from env config
+# ======================================================
+DEFAULT_PURPOSE_RUSSIA = onetrust_config["default_purpose_1"]
+DEFAULT_PURPOSE_OTHER  = onetrust_config["default_purpose_2"]
+DEFAULT_PURPOSE_NOTE   = "ciam"
+
+
+SSL_CONTEXT = None
+if REQUESTS_CA_BUNDLE and isinstance(REQUESTS_CA_BUNDLE, str):
+    import ssl
+    SSL_CONTEXT = ssl.create_default_context(cafile=REQUESTS_CA_BUNDLE)
+
+if REQUESTS_CA_BUNDLE:
+    if os.path.exists(REQUESTS_CA_BUNDLE):
+        logger.info("SSL FILE CHECK (cold start): File EXISTS at '%s' | SSL = ON ✅", REQUESTS_CA_BUNDLE)
+    else:
+        logger.error("SSL FILE CHECK (cold start): File MISSING at '%s' | SSL = OFF ❌", REQUESTS_CA_BUNDLE)
+else:
+    logger.info("SSL FILE CHECK (cold start): REQUESTS_CA_BUNDLE not set | SSL = OFF ❌")
+
+# ======================================================
+# AWS CLIENTS
+# ======================================================
+botocore_cfg = Config(
+    region_name=AWS_REGION,
+    retries={"max_attempts": 3, "mode": "standard"},
+    read_timeout=10,
+    connect_timeout=5,
+)
+secrets_client = boto3.client("secretsmanager", config=botocore_cfg)
+dynamodb_res   = boto3.resource("dynamodb",      config=botocore_cfg)
+sqs_client     = boto3.client("sqs",             config=botocore_cfg)
+
+purpose_table  = dynamodb_res.Table(PURPOSE_TABLE)
+pref_table     = dynamodb_res.Table(PREFERENCE_TABLE)
+country_table  = dynamodb_res.Table(COUNTRY_TABLE)
+
+# ======================================================
+# Module-level country cache
+# ======================================================
+_country_cache: dict = {}
+
+# ======================================================
+# API CALL COUNTER
+# ======================================================
+def _log_api_call(call_counts: dict, endpoint_label: str, cid: str) -> int:
+    call_counts[endpoint_label] += 1
+    count = call_counts[endpoint_label]
+    total = sum(call_counts.values())
+    logger.info(
+        "[%s] [API_CALL_COUNTER] endpoint='%s' | call_number=%d | total_so_far=%d",
+        cid, endpoint_label, count, total,
+    )
+    return count
+
+def _log_api_summary(call_counts: dict, cid: str) -> None:
+    total = sum(call_counts.values())
+    logger.info(
+        "[%s] [API_CALL_SUMMARY] total_api_calls=%d | breakdown=%s",
+        cid, total, json.dumps(dict(call_counts)),
+    )
+
+# ======================================================
+# SKIPPED ITEMS SUMMARY LOGGER
+# ======================================================
+def _log_skipped_summary(skipped_items: list, cid: str) -> None:
+    if not skipped_items:
+        logger.info("[%s] [SKIPPED_SUMMARY] total_skipped=0 | no items were skipped", cid)
+        return
+    logger.warning(
+        "[%s] [SKIPPED_SUMMARY] total_skipped=%d | see SKIPPED_ITEM lines below",
+        cid, len(skipped_items)
+    )
+    for idx, item in enumerate(skipped_items, start=1):
+        logger.warning(
+            "[%s] [SKIPPED_ITEM] #%d | type='%s' | identifier='%s' | position='%s' | reason='%s'",
+            cid,
+            idx,
+            item.get("type", "unknown"),
+            item.get("identifier", "unknown"),
+            item.get("position", "n/a"),
+            item.get("reason", "unknown"),
+        )
+
+
+# ======================================================
+# SKIPPED MESSAGE BUILDER (deduped)
+# ======================================================
+def _build_skipped_message(skipped_items: list) -> str:
+    seen_msgs = set()
+    parts = []
+    for item in skipped_items:
+        msg = (
+            f"{item.get('type', 'item').capitalize()} '{item.get('identifier', 'unknown')}'"
+            f" skipped — {item.get('reason', 'unknown reason')}"
+        )
+        if msg not in seen_msgs:
+            seen_msgs.add(msg)
+            parts.append(msg)
+    return " | ".join(parts) if parts else "No valid consents or subscriptions provided."
+
+
+# ======================================================
+# EMAIL VALIDATOR
+# ======================================================
+EMAIL_REGEX = re.compile(
+    r"^[a-zA-Z0-9_%+\-]+(\.[a-zA-Z0-9_%+\-]+)*"
+    r"@[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?"
+    r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*"
+    r"\.[a-zA-Z]{2,6}$"
+)
+
+def validate_email(email: str) -> bool:
+    if not email or not isinstance(email, str):
+        return False
+    return bool(EMAIL_REGEX.match(email.strip()))
+
+
+# ======================================================
+# DATE VALIDATOR — returns (normalized_date, error_reason)
+# ======================================================
+DATE_TRUNCATED_REGEX = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$"
+)
+
+def _validate_strict_date(date_str: str):
+    if not date_str or not isinstance(date_str, str):
+        return None, "date is missing or empty"
+
+    truncated = date_str.strip()[:19]
+
+    if not DATE_TRUNCATED_REGEX.match(truncated):
+        return None, f"invalid format '{date_str}' — expected YYYY-MM-DDTHH:MM:SS"
+
+    try:
+        datetime.strptime(truncated, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None, f"invalid format '{date_str}' — expected YYYY-MM-DDTHH:MM:SS"
+
+    return truncated[:10] + "T" + truncated[11:], None
+
+
+# ======================================================
+# IDENTIFIER FORMAT VALIDATOR
+# ======================================================
+IDENTIFIER_REGEX = re.compile(r"^[A-Za-z0-9]+(_[A-Za-z0-9]+){2,}$")
+
+def _validate_identifier_format(identifier: str) -> bool:
+    return bool(IDENTIFIER_REGEX.match(identifier.strip()))
+
+
+# ======================================================
+# RESPONSE BUILDER
+# ======================================================
+def _build_response(status: int, body: dict) -> dict:
+    return {
+        "isBase64Encoded": False,
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body),
+    }
+
+
+# ======================================================
+# PARSE EVENT BODY
+# ======================================================
+def parse_event_body(event: dict) -> dict:
+    body   = event.get("body")
+    is_b64 = event.get("isBase64Encoded", False)
+
+    if isinstance(body, dict):
+        return body
+    if body is None:
+        return event.copy()
+    if is_b64 and isinstance(body, str):
+        body = base64.b64decode(body).decode("utf-8")
+    if isinstance(body, str):
+        return json.loads(body)
+    raise ValueError("Unsupported body type; must be JSON string or dict")
+
+
+# ======================================================
+# SQS DLQ
+# ======================================================
+def _send_to_dlq_sync(original_event: dict, failure_reason: str, failure_stage: str) -> None:
+    message = {
+        "failure_stage":  failure_stage,
+        "failure_reason": failure_reason,
+        "original_event": original_event,
+    }
+    message_body = json.dumps(message)
+
+    if len(message_body.encode("utf-8")) > 250_000:
+        logger.warning(
+            "[DLQ] Message too large (%d bytes) — stripping headers to fit SQS limit",
+            len(message_body.encode("utf-8"))
+        )
+        slim_event = {
+            k: v for k, v in original_event.items()
+            if k not in ("headers", "multiValueHeaders", "requestContext")
+        }
+        message["original_event"] = slim_event
+        message_body = json.dumps(message)
+
+    if len(message_body.encode("utf-8")) > 250_000:
+        logger.warning("[DLQ] Still too large after header strip — truncating body")
+        slim_event["body"] = "[TRUNCATED — body exceeded SQS size limit]"
+        message["original_event"] = slim_event
+        message_body = json.dumps(message)
+
+    try:
+        resp = sqs_client.send_message(
+            QueueUrl    = SQS_DLQ_URL,
+            MessageBody = message_body,
+            MessageAttributes={
+                "failure_stage": {
+                    "DataType":    "String",
+                    "StringValue": failure_stage,
+                },
+                "failure_reason": {
+                    "DataType":    "String",
+                    "StringValue": failure_reason[:256],
+                },
+            },
+        )
+        logger.info(
+            "[DLQ] Message sent to SQS | queue='%s' | stage='%s' | reason='%s' | MessageId='%s'",
+            SQS_DLQ_URL, failure_stage, failure_reason, resp.get("MessageId"),
+        )
+    except ClientError as e:
+        logger.error(
+            "[DLQ] FAILED to send message to SQS | queue='%s' | stage='%s' | sqs_error='%s'",
+            SQS_DLQ_URL, failure_stage, str(e),
+        )
+
+async def send_to_dlq(original_event: dict, failure_reason: str, failure_stage: str) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _send_to_dlq_sync, original_event, failure_reason, failure_stage)
+
+
+# ======================================================
+# SECRETS MANAGER
+# ======================================================
+def _get_secret_sync() -> dict:
+    try:
+        resp = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+    except ClientError as e:
+        raise RuntimeError(f"Secrets Manager error [{e.response['Error']['Code']}]: {e}") from e
+    secret = resp.get("SecretString")
+    if not secret:
+        raise ValueError("SecretString is empty or missing.")
+    return json.loads(secret)
+
+async def get_secret() -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _get_secret_sync)
+
+
+# ======================================================
+# ONETRUST TOKEN
+# ======================================================
+async def fetch_token(
+    session: aiohttp.ClientSession,
+    client_id: str,
+    client_secret: str,
+    cid: str,
+    call_counts: dict,
+) -> str:
+    _log_api_call(call_counts, "TOKEN_URL", cid)
+    logger.info("[%s] Fetching access token", cid)
+    async with session.post(
+        TOKEN_URL,
+        data={
+            "grant_type":    "client_credentials",
+            "client_id":     client_id,
+            "client_secret": client_secret,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ssl=SSL_CONTEXT if SSL_CONTEXT else False,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as resp:
+        logger.info("[%s] Token response | status=%d", cid, resp.status)
+        if not resp.ok:
+            text = await resp.text()
+            raise RuntimeError(f"Token API HTTP {resp.status}: {text}")
+        data = await resp.json()
+    token = data.get("access_token")
+    if not token:
+        raise ValueError("No access_token in response.")
+    logger.info("[%s] Access token fetched successfully", cid)
+    return token
+
+
+# ======================================================
+# CHECK DATA SUBJECT PROFILE
+# ======================================================
+async def check_profile(
+    session: aiohttp.ClientSession,
+    access_token: str,
+    email: str,
+    cid: str,
+    call_counts: dict,
+) -> bool:
+    _log_api_call(call_counts, "PROFILES_URL_check", cid)
+    logger.info("[%s] Checking profile for email='%s'", cid, email)
+    async with session.get(
+        PROFILES_URL,
+        headers={
+            "Authorization":    f"Bearer {access_token}",
+            "dataElementName":  "email_address",
+            "dataElementValue": email,
+        },
+        ssl=SSL_CONTEXT if SSL_CONTEXT else False,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as resp:
+        logger.info("[%s] Profile check response | status=%d", cid, resp.status)
+        if resp.status == 404:
+            logger.info("[%s] Profile not found (404) for email='%s'", cid, email)
+            return False
+        if not resp.ok:
+            text = await resp.text()
+            raise RuntimeError(f"Profile check HTTP {resp.status}: {text}")
+        data = await resp.json()
+    total = data.get("totalElements", 0)
+    if total > 0:
+        logger.info("[%s] Profile already exists for email='%s'", cid, email)
+        return True
+    logger.info("[%s] Profile does not exist for email='%s'", cid, email)
+    return False
+
+
+# ======================================================
+# FETCH FULL DATA SUBJECT PROFILE BY OT UUID
+# ======================================================
+async def fetch_data_subject_by_uuid(
+    session: aiohttp.ClientSession,
+    access_token: str,
+    ot_uuid: str,
+    cid: str,
+    call_counts: dict,
+) -> dict:
+    _log_api_call(call_counts, "PROFILES_URL_fetch_uuid", cid)
+    logger.info("[%s] Fetching profile by UUID='%s'", cid, ot_uuid)
+    async with session.get(
+        PROFILES_URL,
+        params={"identifier": ot_uuid},
+        headers={"Authorization": f"Bearer {access_token}"},
+        ssl=SSL_CONTEXT if SSL_CONTEXT else False,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as resp:
+        logger.info("[%s] Fetch by UUID response | status=%d", cid, resp.status)
+        if not resp.ok:
+            text = await resp.text()
+            raise RuntimeError(f"Data subject fetch by UUID HTTP {resp.status}: {text}")
+        data = await resp.json()
+    content = data.get("content", [])
+    if not content:
+        logger.warning("[%s] No profile found for UUID='%s' — OneTrust may still be processing", cid, ot_uuid)
+        return {}
+    logger.info("[%s] Profile fetched successfully for UUID='%s'", cid, ot_uuid)
+    return content[0]
+
+
+# ======================================================
+# FETCH COLLECTION POINT TOKEN
+# ======================================================
+async def fetch_request_info(
+    session: aiohttp.ClientSession,
+    access_token: str,
+    cid: str,
+    call_counts: dict,
+) -> str:
+    _log_api_call(call_counts, "COLLECTION_POINT_URL", cid)
+    logger.info("[%s] Fetching collection point token", cid)
+    async with session.get(
+        COLLECTION_POINT_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        ssl=SSL_CONTEXT if SSL_CONTEXT else False,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as resp:
+        logger.info("[%s] Collection point response | status=%d", cid, resp.status)
+        if not resp.ok:
+            text = await resp.text()
+            raise RuntimeError(f"Collection point API HTTP {resp.status}: {text}")
+        data = await resp.json()
+    token = data.get("token")
+    if not token:
+        raise ValueError("No token found in collection point response.")
+    logger.info("[%s] Collection point token fetched", cid)
+    return token
+
+
+# ======================================================
+# SUBMIT CONSENT RECEIPT
+# ======================================================
+async def submit_consent(
+    session: aiohttp.ClientSession,
+    access_token: str,
+    payload: dict,
+    cid: str,
+    call_counts: dict,
+) -> dict:
+    _log_api_call(call_counts, "CONSENT_URL", cid)
+    logger.info("[%s] Submitting consent receipt", cid)
+    async with session.post(
+        CONSENT_URL,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type":  "application/json",
+        },
+        ssl=SSL_CONTEXT if SSL_CONTEXT else False,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as resp:
+        logger.info("[%s] Consent receipt response | status=%d", cid, resp.status)
+        if not resp.ok:
+            text = await resp.text()
+            raise RuntimeError(f"Consent receipt HTTP {resp.status}: {text}")
+        data = await resp.json()
+    logger.info("[%s] Consent receipt submitted successfully", cid)
+    return data
+
+
+# ======================================================
+# DYNAMODB — PURPOSE LOOKUP
+# ======================================================
+def _get_purpose_id_sync(purpose_name: str) -> str:
+    try:
+        resp = purpose_table.get_item(Key={"Purpose_Name": purpose_name})
+        item = resp.get("Item")
+        if not item or "Purpose_ID" not in item:
+            raise RuntimeError(f"Purpose '{purpose_name}' not found in {PURPOSE_TABLE}.")
+        return item["Purpose_ID"]
+    except ClientError as e:
+        raise RuntimeError(f"DynamoDB error [{e.response['Error']['Code']}]: {e}") from e
+
+async def get_purpose_id(purpose_name: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _get_purpose_id_sync, purpose_name)
+
+
+# ======================================================
+# DYNAMODB — PREFERENCE LOOKUP
+# ======================================================
+def _get_preference_item_sync(unique_subscription_id: str) -> dict:
+    try:
+        resp = pref_table.get_item(Key={"UniqueSubcriptionID": unique_subscription_id})
+        item = resp.get("Item")
+        if not item:
+            raise RuntimeError(f"Subscription '{unique_subscription_id}' not found in {PREFERENCE_TABLE}.")
+        return item
+    except ClientError as e:
+        raise RuntimeError(f"DynamoDB error [{e.response['Error']['Code']}]: {e}") from e
+
+async def get_preference_item(unique_subscription_id: str) -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _get_preference_item_sync, unique_subscription_id)
+
+
+# ======================================================
+# DYNAMODB — COUNTRY CODE LOOKUP
+# ======================================================
+def _get_country2code_sync(cs_country: str) -> str:
+    if not cs_country or not cs_country.strip():
+        raise ValueError("cs_country is missing or empty.")
+    val_upper = cs_country.strip().upper()
+    if len(val_upper) != 3:
+        raise ValueError("cs_country is not valid.")
+
+    if val_upper in _country_cache:
+        logger.info("Country code: '%s' -> '%s' (from cache)", val_upper, _country_cache[val_upper])
+        return _country_cache[val_upper]
+
+    try:
+        resp = country_table.get_item(Key={"country3code": val_upper})
+        item = resp.get("Item")
+        if item:
+            country2code = item["country2code"].upper()
+            _country_cache[val_upper] = country2code
+            logger.info("Country code: '%s' -> '%s' (from DynamoDB, now cached)", val_upper, country2code)
+            return country2code
+    except ClientError as e:
+        raise RuntimeError(f"DynamoDB error [{e.response['Error']['Code']}]: {e}") from e
+    raise ValueError(
+        f"Country '{cs_country}' not found in ot_country_map. "
+        "Please provide a valid 3-letter country code."
+    )
+
+async def get_country2code(cs_country: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _get_country2code_sync, cs_country)
+
+
+# ======================================================
+# PRE-FLIGHT VALIDATION
+# ======================================================
+def preflight_validate(cs_consents: list, cs_subscriptions: list, cid: str) -> tuple:
+    valid_consents      = []
+    valid_subscriptions = []
+    skipped_items       = []
+
+    for idx, consent in enumerate(cs_consents):
+        identifier    = consent.get("identifier")
+        consent_val   = consent.get("consent")
+        signature_raw = consent.get("signatureDate", "")
+        create_raw    = consent.get("createDate", "")
+        pos           = f"cs_consents[{idx}]"
+
+        if not identifier or not isinstance(identifier, str) or not identifier.strip():
+            logger.warning("[%s] CONSENT_SKIP_NO_IDENTIFIER | %s", cid, pos)
+            skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "reason": "Identifier is empty or missing"})
+            continue
+
+        if not _validate_identifier_format(identifier):
+            logger.warning("[%s] CONSENT_SKIP_INVALID_IDENTIFIER_FORMAT | %s | identifier='%s'", cid, pos, identifier)
+            skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "reason": "Invalid identifier format"})
+            continue
+
+        if not isinstance(consent_val, bool):
+            logger.warning("[%s] CONSENT_SKIP_INVALID_CONSENT_VALUE | %s | identifier='%s' | value='%s'", cid, pos, identifier, consent_val)
+            skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "reason": f"Invalid consent value '{consent_val}' — only true or false are valid"})
+            continue
+
+        if not signature_raw:
+            logger.warning("[%s] CONSENT_SKIP_NO_SIGNATURE_DATE | %s | identifier='%s'", cid, pos, identifier)
+            skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "reason": "signatureDate is missing or empty"})
+            continue
+
+        normalized_sig_date, sig_date_error = _validate_strict_date(signature_raw)
+        if not normalized_sig_date:
+            reason = f"signatureDate '{signature_raw}' — {sig_date_error}"
+            logger.warning("[%s] CONSENT_SKIP_INVALID_SIGNATURE_DATE | %s | identifier='%s' | reason='%s'", cid, pos, identifier, reason)
+            skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "signatureDate": signature_raw, "reason": reason})
+            continue
+
+        parsed_sig = datetime.strptime(normalized_sig_date, "%Y-%m-%dT%H:%M:%S")
+        if parsed_sig > datetime.utcnow():
+            reason = f"signatureDate '{normalized_sig_date}' is greater than today's date and is not accepted"
+            logger.warning("[%s] CONSENT_SKIP_FUTURE_SIGNATURE_DATE | %s | identifier='%s' | reason='%s'", cid, pos, identifier, reason)
+            skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "signatureDate": signature_raw, "reason": reason})
+            continue
+
+        if not create_raw:
+            normalized_create_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+            logger.info("[%s] CONSENT_CREATE_DATE_NULL | %s | identifier='%s' | createDate is null, using system date='%s'", cid, pos, identifier, normalized_create_date)
+        else:
+            normalized_create_date, create_date_error = _validate_strict_date(create_raw)
+            if not normalized_create_date:
+                reason = f"createDate '{create_raw}' — {create_date_error}"
+                logger.warning("[%s] CONSENT_SKIP_INVALID_CREATE_DATE | %s | identifier='%s' | reason='%s'", cid, pos, identifier, reason)
+                skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "createDate": create_raw, "reason": reason})
+                continue
+
+            parsed_create = datetime.strptime(normalized_create_date, "%Y-%m-%dT%H:%M:%S")
+            if parsed_create > datetime.utcnow():
+                reason = f"createDate '{normalized_create_date}' is greater than today's date and is not accepted"
+                logger.warning("[%s] CONSENT_SKIP_FUTURE_CREATE_DATE | %s | identifier='%s' | reason='%s'", cid, pos, identifier, reason)
+                skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "createDate": create_raw, "reason": reason})
+                continue
+
+        source = consent.get("source")
+        if not source or not isinstance(source, str) or not source.strip():
+            logger.error("[%s] CONSENT_SKIP_NO_SOURCE | %s | identifier='%s'", cid, pos, identifier)
+            skipped_items.append({"type": "consent", "position": pos, "identifier": identifier, "reason": "source is missing or empty"})
+            continue
+
+        consent = dict(consent)
+        consent["signatureDate"]          = normalized_sig_date
+        consent["_normalized_createDate"] = normalized_create_date
+        valid_consents.append(consent)
+
+    for idx, sub in enumerate(cs_subscriptions):
+        identifier  = sub.get("identifier")
+        opt_in      = sub.get("optIn")
+        opt_in_date = sub.get("optInDate", "")
+        pos         = f"cs_subscriptions[{idx}]"
+
+        if not identifier or not isinstance(identifier, str) or not identifier.strip():
+            logger.warning("[%s] SUBSCRIPTION_SKIP_NO_IDENTIFIER | %s", cid, pos)
+            skipped_items.append({"type": "subscription", "position": pos, "identifier": identifier, "reason": "identifier is missing or empty"})
+            continue
+
+        if not isinstance(opt_in, bool):
+            logger.warning("[%s] SUBSCRIPTION_SKIP_INVALID_OPT_IN_VALUE | %s | identifier='%s' | value='%s'", cid, pos, identifier, opt_in)
+            skipped_items.append({"type": "subscription", "position": pos, "identifier": identifier, "reason": f"optIn must be true or false, got '{opt_in}'"})
+            continue
+
+        if not opt_in_date:
+            logger.warning("[%s] SUBSCRIPTION_SKIP_NO_OPT_IN_DATE | %s | identifier='%s'", cid, pos, identifier)
+            skipped_items.append({"type": "subscription", "position": pos, "identifier": identifier, "reason": "optInDate is missing or empty"})
+            continue
+
+        normalized_date, date_error = _validate_strict_date(opt_in_date)
+        if not normalized_date:
+            reason = f"optInDate '{opt_in_date}' — {date_error}"
+            logger.warning("[%s] SUBSCRIPTION_SKIP_INVALID_OPT_IN_DATE | %s | identifier='%s' | reason='%s'", cid, pos, identifier, reason)
+            skipped_items.append({"type": "subscription", "position": pos, "identifier": identifier, "reason": reason})
+            continue
+
+        opt_location = sub.get("optLocation")
+        if not opt_location or not isinstance(opt_location, str) or not opt_location.strip():
+            logger.error("[%s] SUBSCRIPTION_SKIP_NO_OPT_LOCATION | %s | identifier='%s'", cid, pos, identifier)
+            skipped_items.append({"type": "subscription", "position": pos, "identifier": identifier, "reason": "optLocation is missing or empty"})
+            continue
+
+        sub = dict(sub)
+        sub["_normalized_optInDate"] = normalized_date
+        valid_subscriptions.append(sub)
+
+    logger.info("[%s] Preflight done | consents=%d | subscriptions=%d | skipped=%d",
+                cid, len(valid_consents), len(valid_subscriptions), len(skipped_items))
+    return valid_consents, valid_subscriptions, skipped_items
+
+
+# ======================================================
+# CONSENT PURPOSE VALIDATION
+# ======================================================
+async def _validate_consent_purposes(
+    valid_consents: list,
+    skipped_items: list,
+    cid: str,
+) -> tuple:
+    checked_consents = []
+    for consent in valid_consents:
+        identifier = consent.get("identifier", "")
+        try:
+            purpose_id = await get_purpose_id(identifier)
+            consent = dict(consent)
+            consent["_cached_purpose_id"] = purpose_id
+            checked_consents.append(consent)
+            logger.info("[%s] Consent '%s' purpose validated | found in purpose table", cid, identifier)
+        except RuntimeError:
+            logger.error("[%s] Consent '%s' skipped | not found in purpose table", cid, identifier)
+            skipped_items.append({
+                "type":       "consent",
+                "identifier": identifier,
+                "reason":     f"identifier '{identifier}' not found in purpose table — not a valid consent for this country",
+            })
+    return checked_consents, skipped_items
+
+
+# ======================================================
+# SUBSCRIPTION PREFERENCE VALIDATION
+# ======================================================
+async def _validate_subscription_preferences(
+    valid_subscriptions: list,
+    country_code: str,
+    skipped_items: list,
+    cid: str,
+) -> tuple:
+    checked_subscriptions = []
+    for sub in valid_subscriptions:
+        identifier = sub.get("identifier", "")
+        unique_id  = f"{country_code}_{identifier}"
+        try:
+            pref_item = await get_preference_item(unique_id)
+            sub["_cached_pref_item"] = pref_item
+            checked_subscriptions.append(sub)
+            logger.info("[%s] Subscription '%s' preference validated | found in preference table", cid, unique_id)
+        except RuntimeError:
+            logger.error("[%s] Subscription '%s' skipped | not found in preference table", cid, unique_id)
+            skipped_items.append({
+                "type":       "subscription",
+                "identifier": identifier,
+                "reason":     f"identifier '{identifier}' not found in preference table for country — not a valid subscription for this country",
+            })
+    return checked_subscriptions, skipped_items
+
+
+# ======================================================
+# SUBSCRIPTION DATE RESOLUTION
+# ======================================================
+async def _resolve_subscription_dates(
+    valid_subscriptions: list,
+    country_code: str,
+    skipped_items: list,
+    cid: str,
+) -> tuple:
+
+    global_first_date = None
+
+    for sub in valid_subscriptions:
+        identifier = sub.get("identifier", "").strip()
+        norm_date  = sub.get("_normalized_optInDate", "")
+        unique_id  = f"{country_code}_{identifier}"
+
+        if not norm_date:
+            continue
+
+        if sub.get("_cached_pref_item"):
+            global_first_date = norm_date
+            logger.info(
+                "[%s] First valid optInDate found | identifier='%s' | country_key='%s' | "
+                "date='%s' | will use for all subscriptions",
+                cid, identifier, unique_id, norm_date,
+            )
+            break
+        else:
+            logger.warning(
+                "[%s] Skipping for date selection | identifier='%s' | "
+                "reason: not found in preference table for country='%s'",
+                cid, identifier, country_code,
+            )
+
+    if not global_first_date:
+        logger.warning("[%s] SUBSCRIPTION_SKIP_NO_VALID_DATE | reason: no valid subscription found with valid optInDate.", cid)
+        return [], skipped_items
+
+    logger.info("[%s] interactionDate='%s' will be applied to all %d subscription(s)",
+                cid, global_first_date, len(valid_subscriptions))
+
+    for sub in valid_subscriptions:
+        identifier    = sub.get("identifier", "").strip()
+        original_date = sub.get("_normalized_optInDate", "")
+        if original_date != global_first_date:
+            logger.info("[%s] Subscription '%s' | own date='%s' -> overridden to '%s'",
+                        cid, identifier, original_date, global_first_date)
+        sub["_normalized_optInDate"] = global_first_date
+
+    logger.info("[%s] All %d subscription(s) assigned interactionDate='%s'",
+                cid, len(valid_subscriptions), global_first_date)
+    return valid_subscriptions, skipped_items
+
+
+# ======================================================
+# BUILD BASE PAYLOAD SKELETON
+# ======================================================
+def _base_payload(ot_uuid, email, first_name, last_name, cs_country,
+                  hcp_status, profile_type, request_info, interaction_date, purposes,
+                  mobile_number=None):
+    additional_identifiers = {"email_address": email}
+    if mobile_number:
+        additional_identifiers["mobile_number"] = mobile_number
+
+    return {
+        "identifier":            ot_uuid,
+        "identifierType":        "Sanofi_OT_uuid",
+        "additionalIdentifiers": additional_identifiers,
+        "requestInformation":    request_info,
+        "interactionDate":       interaction_date,
+        "purposes":              purposes,
+        "dsDataElements": {
+            "first_name":      first_name,
+            "last_name":       last_name,
+            "hcp_countrycode": cs_country,
+            "hcp_status":      hcp_status,
+            "profile_type":    profile_type,
+        },
+    }
+
+
+# ======================================================
+# MAP consents -> purposes list
+# ======================================================
+async def _map_consents_to_purposes(consents: list, skipped_items: list, cid: str) -> list:
+    purposes = []
+    for consent in consents:
+        identifier  = consent.get("identifier")
+        consent_val = consent.get("consent")
+
+        if not consent.get("signatureDate"):
+            logger.warning("[%s] Consent '%s' has no signatureDate, skipping", cid, identifier)
+            continue
+
+        transaction_type = "CONFIRMED" if consent_val else "OPT_OUT"
+        logger.info("[%s] Consent '%s' | value=%s | type=%s", cid, identifier, consent_val, transaction_type)
+
+        purpose_id = consent.get("_cached_purpose_id")
+        if not purpose_id:
+            try:
+                purpose_id = await get_purpose_id(identifier)
+            except RuntimeError as e:
+                logger.error("[%s] Consent '%s' skipped | %s", cid, identifier, str(e))
+                skipped_items.append({
+                    "type":       "consent",
+                    "identifier": identifier,
+                    "reason":     f"identifier '{identifier}' not found in purpose table — not a valid consent for this country",
+                })
+                continue
+
+        note_text = json.dumps({
+            "source":      consent.get("source", ""),
+            "createdDate": consent.get("_normalized_createDate", ""),
+        }, separators=(",", ":"))
+
+        logger.info("[%s] Consent '%s' mapped to PurposeID='%s' | noteText=%s",
+                    cid, identifier, purpose_id, note_text)
+        purposes.append({
+            "Id":              purpose_id,
+            "TransactionType": transaction_type,
+            "PurposeNote": {
+                "noteType":     "UNSUBSCRIBE_REASON",
+                "noteLanguage": "en-us",
+                "noteText":     note_text,
+            },
+        })
+    return purposes
+
+
+# ======================================================
+# MAP subscriptions -> purposes list
+# ======================================================
+async def _map_subscriptions_to_purposes(
+    cs_subscriptions: list,
+    country_code: str,
+    skipped_items: list,
+    cid: str,
+) -> list:
+    if not cs_subscriptions:
+        return []
+
+    purpose_choices = defaultdict(lambda: {"purpose_id": None, "pref_list_id": None, "choices": []})
+
+    for sub in cs_subscriptions:
+        identifier = sub.get("identifier", "")
+        opt_in     = sub.get("optIn", False)
+        unique_id  = f"{country_code}_{identifier}"
+        logger.info("[%s] Looking up subscription '%s'", cid, unique_id)
+
+        pref_item = sub.get("_cached_pref_item")
+        if not pref_item:
+            try:
+                pref_item = await get_preference_item(unique_id)
+            except RuntimeError as e:
+                logger.error("[%s] Subscription '%s' skipped | %s", cid, unique_id, str(e))
+                skipped_items.append({
+                    "type":       "subscription",
+                    "identifier": identifier,
+                    "reason":     f"identifier '{identifier}' not found in preference table for country — not a valid subscription for this country",
+                })
+                continue
+
+        purpose_id   = pref_item.get("PurposeID")
+        pref_list_id = pref_item.get("PurposeListID")
+        option_id    = pref_item.get("CustomePrefernceOptionid")
+        if not purpose_id or not pref_list_id or not option_id:
+            logger.error("[%s] Subscription '%s' skipped | missing fields in preference table", cid, unique_id)
+            skipped_items.append({
+                "type":       "subscription",
+                "identifier": identifier,
+                "reason":     f"identifier '{identifier}' found in preference table but missing required fields (PurposeID / PurposeListID / OptionID)",
+            })
+            continue
+
+        purpose_choices[purpose_id]["purpose_id"]   = purpose_id
+        purpose_choices[purpose_id]["pref_list_id"] = pref_list_id
+        purpose_choices[purpose_id]["choices"].append({
+            "TransactionType": "OPT_IN" if opt_in else "OPT_OUT",
+            "OptionId":        option_id,
+        })
+        logger.info("[%s] Subscription '%s' mapped to PurposeID='%s' | optIn=%s",
+                    cid, unique_id, purpose_id, opt_in)
+
+    purposes = []
+    for purpose_id, data in purpose_choices.items():
+        purposes.append({
+            "Id":              purpose_id,
+            "TransactionType": "CHANGE_PREFERENCES",
+            "CustomPreferences": [{"Id": data["pref_list_id"], "Choices": data["choices"]}],
+        })
+        logger.info("[%s] Built CHANGE_PREFERENCES | PurposeID='%s' | choices=%d",
+                    cid, purpose_id, len(data["choices"]))
+    return purposes
+
+
+# ======================================================
+# BUILD DEFAULT PURPOSE PAYLOAD
+# ======================================================
+async def _build_default_purpose_payload(
+    event: dict,
+    request_info: str,
+    country_code: str,
+    cs_country: str,
+    ot_uuid: str,
+    cid: str,
+) -> dict:
+    default_identifier = (
+        DEFAULT_PURPOSE_RUSSIA if country_code == "RU" else DEFAULT_PURPOSE_OTHER
+    )
+    logger.info(
+        "[%s] DEFAULT_PURPOSE | country_code='%s' | using identifier='%s'",
+        cid, country_code, default_identifier,
+    )
+
+    try:
+        purpose_id = await get_purpose_id(default_identifier)
+        logger.info(
+            "[%s] DEFAULT_PURPOSE | resolved PurposeID='%s' for identifier='%s'",
+            cid, purpose_id, default_identifier,
+        )
+    except RuntimeError as e:
+        logger.error(
+            "[%s] DEFAULT_PURPOSE | Failed to resolve PurposeID for '%s' | %s",
+            cid, default_identifier, str(e),
+        )
+        raise
+
+    interaction_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    logger.info("[%s] DEFAULT_PURPOSE | interactionDate='%s'", cid, interaction_date)
+
+    email        = event.get("email", "")
+    first_name   = event.get("given_name") or ""
+    last_name    = event.get("family_name") or ""
+    hcp_status   = event.get("hcp_status") or "ACTIVE"
+    profile_type = event.get("profile_type") or "HCP"
+
+    mobile_number = None
+    if country_code == "US":
+        mobile_number = event.get("mobile_number") or None
+        if mobile_number:
+            logger.info("[%s] DEFAULT_PURPOSE | USA market | mobile_number present", cid)
+        else:
+            logger.info("[%s] DEFAULT_PURPOSE | USA market | mobile_number not provided", cid)
+    else:
+        logger.info("[%s] DEFAULT_PURPOSE | Non-USA market (country='%s') | mobile_number ignored", cid, country_code)
+
+    purposes = [
+        {
+            "Id":              purpose_id,
+            "TransactionType": "NOTGIVEN",
+            "PurposeNote": {
+                "noteType":     "UNSUBSCRIBE_REASON",
+                "noteLanguage": "en-us",
+                "noteText":     DEFAULT_PURPOSE_NOTE,
+            },
+        }
+    ]
+
+    payload = _base_payload(
+        ot_uuid, email, first_name, last_name, cs_country,
+        hcp_status, profile_type, request_info, interaction_date, purposes,
+        mobile_number=mobile_number,
+    )
+
+    logger.info(
+        "[%s] DEFAULT_PURPOSE | payload built | identifier='%s' | PurposeID='%s' | interactionDate='%s'",
+        cid, default_identifier, purpose_id, interaction_date,
+    )
+    return payload
+
+
+# ======================================================
+# BUILD CONSENT PAYLOAD  (normal path)
+# ======================================================
+async def build_consent_payload(
+    event: dict,
+    request_info: str,
+    skipped_items: list,
+    country_code: str,
+    cid: str,
+) -> tuple:
+    email        = event.get("email", "")
+    first_name   = event.get("given_name") or ""
+    last_name    = event.get("family_name") or ""
+    cs_country   = event.get("cs_country", "")
+    hcp_status   = event.get("hcp_status") or "ACTIVE"
+    profile_type = event.get("profile_type") or "HCP"
+
+    if country_code == "US":
+        mobile_number = event.get("mobile_number") or None
+        if mobile_number:
+            logger.info("[%s] USA market | mobile_number present | will be added as additional identifier", cid)
+        else:
+            logger.info("[%s] USA market | mobile_number not provided | will be skipped", cid)
+    else:
+        mobile_number = None
+        logger.info("[%s] Non-USA market (country='%s') | mobile_number ignored", cid, country_code)
+
+    ot_uuid = f"OT_{uuid.uuid4()}"
+    logger.info("[%s] Generated OT UUID: %s", cid, ot_uuid)
+    logger.info("[%s] hcp_status=%s | profile_type=%s", cid, hcp_status, profile_type)
+
+    cs_consents      = event.get("_valid_consents", [])
+    cs_subscriptions = event.get("_valid_subscriptions", [])
+
+    # ── Deduplicate consents ──────────────────────────────────────────────────
+    identifier_counts = Counter(c.get("identifier", "") for c in cs_consents)
+
+    for identifier, count in identifier_counts.items():
+        if count > 1:
+            logger.error(
+                "[%s] DUPLICATE_CONSENT_IDENTIFIER | Consent '%s' — identifier appears more than once "
+                "in cs_consents. All occurrences will be skipped.",
+                cid, identifier,
+            )
+
+    unique_consents = []
+    for consent in cs_consents:
+        identifier = consent.get("identifier", "")
+        if identifier_counts[identifier] > 1:
+            skipped_items.append({
+                "type":       "consent",
+                "identifier": identifier,
+                "position":   "duplicate",
+                "reason": (
+                    f"Duplicate identifier '{identifier}' — appears more than once "
+                    f"in cs_consents. All occurrences are skipped."
+                ),
+            })
+        else:
+            unique_consents.append(consent)
+
+    dupes_dropped = len(cs_consents) - len(unique_consents)
+    logger.info(
+        "[%s] Dedup complete | original=%d | after_dedup=%d | duplicates_skipped=%d",
+        cid, len(cs_consents), len(unique_consents), dupes_dropped,
+    )
+    cs_consents = unique_consents
+    # ─────────────────────────────────────────────────────────────────────────
+
+    logger.info("[%s] Building payload | consents=%d | subscriptions=%d",
+                cid, len(cs_consents), len(cs_subscriptions))
+
+    date_map: dict = defaultdict(lambda: {"consents": [], "subscriptions": []})
+    for c in cs_consents:
+        date_map[c.get("signatureDate", "")]["consents"].append(c)
+    for s in cs_subscriptions:
+        date_map[s["_normalized_optInDate"]]["subscriptions"].append(s)
+
+    all_dates = list(dict.fromkeys(
+        [c.get("signatureDate", "") for c in cs_consents]
+        + ([cs_subscriptions[0]["_normalized_optInDate"]] if cs_subscriptions else [])
+    ))
+
+    logger.info("[%s] Date buckets (%d): %s", cid, len(all_dates), all_dates)
+
+    def _build(interaction_date, purposes):
+        return _base_payload(ot_uuid, email, first_name, last_name, cs_country,
+                             hcp_status, profile_type, request_info, interaction_date, purposes,
+                             mobile_number=mobile_number)
+
+    payloads = []
+    for date in all_dates:
+        bucket = date_map[date]
+        consent_purposes, sub_purposes = await asyncio.gather(
+            _map_consents_to_purposes(bucket["consents"], skipped_items, cid),
+            _map_subscriptions_to_purposes(bucket["subscriptions"], country_code, skipped_items, cid),
+        )
+        all_purposes = consent_purposes + sub_purposes
+        if not all_purposes:
+            logger.warning("[%s] Date bucket '%s' has no valid purposes, skipping", cid, date)
+            continue
+        logger.info("[%s] Date bucket '%s' | total purposes=%d -> 1 call", cid, date, len(all_purposes))
+        payloads.append(_build(date, all_purposes))
+
+    logger.info("[%s] Total CONSENT_URL calls planned: %d", cid, len(payloads))
+    return "single", payloads, ot_uuid
+
+
+# ======================================================
+# PARALLEL CONSENT SUBMISSION
+# ======================================================
+async def _submit_all_payloads(
+    http_session: aiohttp.ClientSession,
+    access_token: str,
+    payloads: list,
+    cid: str,
+    call_counts: dict,
+) -> dict:
+    total = len(payloads)
+    logger.info("[%s] Submitting %d receipt(s) concurrently with asyncio.gather", cid, total)
+
+    async def _submit_one(idx, single_payload):
+        interaction_date = single_payload.get("interactionDate", "unknown")
+        logger.info("[%s] Submitting receipt %d/%d | interactionDate='%s'",
+                    cid, idx, total, interaction_date)
+        logger.info("[%s] Receipt %d/%d payload: %s",
+                    cid, idx, total, json.dumps(single_payload, indent=4))
+        await submit_consent(http_session, access_token, single_payload, cid, call_counts)
+        logger.info("[%s] Receipt %d/%d submitted successfully | interactionDate='%s'",
+                    cid, idx, total, interaction_date)
+        return interaction_date
+
+    results = await asyncio.gather(
+        *[_submit_one(idx, p) for idx, p in enumerate(payloads, start=1)],
+        return_exceptions=True,
+    )
+
+    succeeded = []
+    failed    = []
+
+    for idx, result in enumerate(results, start=1):
+        interaction_date = payloads[idx - 1].get("interactionDate", "unknown")
+        if isinstance(result, Exception):
+            logger.error("[%s] Receipt %d/%d FAILED | interactionDate='%s' | error='%s'",
+                         cid, idx, total, interaction_date, str(result))
+            failed.append({"receipt_number": idx, "interaction_date": interaction_date, "error": str(result)})
+        else:
+            logger.info("[%s] Receipt %d/%d CONFIRMED succeeded | interactionDate='%s'",
+                        cid, idx, total, interaction_date)
+            succeeded.append({"receipt_number": idx, "interaction_date": interaction_date})
+
+    logger.info("[%s] Submission summary | total=%d | succeeded=%d | failed=%d",
+                cid, total, len(succeeded), len(failed))
+    if failed:
+        logger.error("[%s] FAILED RECEIPTS DETAIL: %s", cid, json.dumps(failed, indent=2))
+    if succeeded:
+        logger.info("[%s] SUCCEEDED RECEIPTS DETAIL: %s", cid, json.dumps(succeeded, indent=2))
+
+    return {
+        "succeeded":       succeeded,
+        "failed":          failed,
+        "submitted_count": len(succeeded),
+        "total":           total,
+        "all_failed":      total > 0 and len(failed) == total,
+        "partial":         len(failed) > 0 and len(succeeded) > 0,
+    }
+
+
+# ======================================================
+# ASYNC CORE HANDLER
+# ======================================================
+async def _async_handler(event: dict, context) -> dict:
+
+    cid = str(uuid.uuid4())[:12]
+    call_counts: dict = defaultdict(int)
+    skipped_items: list = []
+
+    logger.info("[%s] Lambda invocation started | remaining_ms=%d",
+                cid, context.get_remaining_time_in_millis())
+
+    if REQUESTS_CA_BUNDLE:
+        if os.path.exists(REQUESTS_CA_BUNDLE):
+            logger.info("[%s] SSL FILE CHECK: File EXISTS at '%s' | SSL = ON ✅", cid, REQUESTS_CA_BUNDLE)
+        else:
+            logger.error("[%s] SSL FILE CHECK: File MISSING at '%s' | SSL = OFF ❌", cid, REQUESTS_CA_BUNDLE)
+    else:
+        logger.info("[%s] SSL FILE CHECK: REQUESTS_CA_BUNDLE not set | SSL = OFF ❌", cid)
+
+    try:
+        original_event = json.loads(json.dumps(event))
+    except (TypeError, ValueError) as e:
+        logger.warning("[%s] Deep copy failed, using shallow copy | %s", cid, str(e))
+        original_event = event.copy()
+
+    is_partial        = False
+    data_subject      = {}
+    submission_result = {}
+
+    # ── 1. Validate src ───────────────────────────────
+    query_params = event.get("queryStringParameters") or {}
+    src = query_params.get("src", "")
+    if not src:
+        logger.error("[%s] src param is missing", cid)
+        return _build_response(400, {"message": "Query String Parameter is empty"})
+    if src.lower() != "ciam":
+        logger.error("[%s] Invalid src param | received='%s'", cid, src)
+        return _build_response(400, {"message": "Invalid Query String Parameter"})
+    logger.info("[%s] src=ciam validated", cid)
+
+    # ── 2. Parse body ─────────────────────────────────
+    try:
+        logger.info("[%s] Parsing request body | type=%s", cid, type(event.get("body")))
+        payload = parse_event_body(event)
+    except Exception as e:
+        logger.error("[%s] Failed to parse body | %s", cid, str(e))
+        return _build_response(400, {"message": f"Invalid request body: {str(e)}"})
+
+    # ── 3. Validate email ─────────────────────────────
+    email = payload.get("email")
+    if not email:
+        logger.error("[%s] email is missing in request", cid)
+        return _build_response(400, {"message": "email is missing in the request."})
+    if not validate_email(email):
+        logger.error("[%s] Invalid email format | email='%s'", cid, email)
+        return _build_response(400, {"message": "email format is invalid. Please provide a valid email address."})
+    logger.info("[%s] Email validated | email='%s'", cid, email)
+
+    # ── 4. Validate cs_country ────────────────────────
+    cs_country = payload.get("cs_country", "")
+    try:
+        country_code = await get_country2code(cs_country)
+        logger.info("[%s] Country validated and resolved | '%s' -> '%s'", cid, cs_country, country_code)
+    except ValueError as e:
+        logger.error("[%s] Country validation failed | %s", cid, str(e))
+        return _build_response(400, {"message": str(e)})
+    except RuntimeError as e:
+        logger.error("[%s] Country DynamoDB error | stage=COUNTRY_LOOKUP | %s", cid, str(e))
+        _log_api_summary(call_counts, cid)
+        await send_to_dlq(original_event, str(e), "COUNTRY_LOOKUP")
+        return _build_response(500, {"message": "Could not validate country. Please try again later."})
+
+    # ── 4b. List type validation ──────────────────────
+    raw_consents      = payload.get("cs_consents")
+    raw_subscriptions = payload.get("cs_subscriptions")
+
+    if raw_consents is None:
+        raw_consents = []
+    if raw_subscriptions is None:
+        raw_subscriptions = []
+
+    if not isinstance(raw_consents, list):
+        return _build_response(400, {"message": "cs_consents must be a list."})
+    if not isinstance(raw_subscriptions, list):
+        return _build_response(400, {"message": "cs_subscriptions must be a list."})
+    if raw_consents and not isinstance(raw_consents[0], dict):
+        return _build_response(400, {"message": "cs_consents must be a list of objects, not a list of strings."})
+    if raw_subscriptions and not isinstance(raw_subscriptions[0], dict):
+        return _build_response(400, {"message": "cs_subscriptions must be a list of objects, not a list of strings."})
+
+    # ── 5. Retrieve secrets ───────────────────────────
+    try:
+        secret        = await get_secret()
+        client_id     = secret["client_id"]
+        client_secret = secret["client_secret"]
+    except Exception as e:
+        logger.error("[%s] Failed to load secrets | stage=SECRETS_MANAGER | %s", cid, str(e))
+        _log_api_summary(call_counts, cid)
+        await send_to_dlq(original_event, str(e), "SECRETS_MANAGER")
+        return _build_response(500, {"message": "Could not load configuration. Please try again later."})
+
+    connector = aiohttp.TCPConnector(limit=20)
+    async with aiohttp.ClientSession(connector=connector) as http_session:
+
+        # ── 6. Fetch access token ─────────────────────
+        try:
+            access_token = await fetch_token(http_session, client_id, client_secret, cid, call_counts)
+        except Exception as e:
+            logger.error("[%s] Failed to fetch token | stage=FETCH_TOKEN | %s", cid, str(e))
+            _log_api_summary(call_counts, cid)
+            await send_to_dlq(original_event, str(e), "FETCH_TOKEN")
+            return _build_response(502, {"message": "Could not connect to OneTrust to get an access token. Please try again later."})
+
+        # ── 7. Check if profile exists ────────────────
+        try:
+            profile_exists = await check_profile(http_session, access_token, email, cid, call_counts)
+        except Exception as e:
+            logger.error("[%s] Profile check failed | stage=PROFILE_CHECK | %s", cid, str(e))
+            _log_api_summary(call_counts, cid)
+            await send_to_dlq(original_event, str(e), "PROFILE_CHECK")
+            return _build_response(502, {"message": "Could not connect to OneTrust. Please try again later."})
+
+        if profile_exists:
+            logger.info("[%s] Profile already exists, no action needed", cid)
+            _log_api_summary(call_counts, cid)
+            _log_skipped_summary(skipped_items, cid)
+            return _build_response(409, {"message": "Profile already exists in OneTrust."})
+
+        # ── 8. Fetch collection point token ───────────
+        try:
+            request_info = await fetch_request_info(http_session, access_token, cid, call_counts)
+        except Exception as e:
+            logger.error("[%s] Collection point fetch failed | stage=COLLECTION_POINT | %s", cid, str(e))
+            _log_api_summary(call_counts, cid)
+            await send_to_dlq(original_event, str(e), "COLLECTION_POINT")
+            return _build_response(502, {"message": "Could not connect to OneTrust. Please try again later."})
+
+        # ── 9. Validate consents & subscriptions ──────
+        valid_consents      = []
+        valid_subscriptions = []
+
+        if raw_consents or raw_subscriptions:
+            valid_consents, valid_subscriptions, skipped_items = preflight_validate(
+                raw_consents, raw_subscriptions, cid
+            )
+
+            if valid_subscriptions:
+                valid_subscriptions, skipped_items = await _validate_subscription_preferences(
+                    valid_subscriptions, country_code, skipped_items, cid
+                )
+
+            if valid_subscriptions:
+                valid_subscriptions, skipped_items = await _resolve_subscription_dates(
+                    valid_subscriptions, country_code, skipped_items, cid
+                )
+
+            if valid_consents:
+                valid_consents, skipped_items = await _validate_consent_purposes(
+                    valid_consents, skipped_items, cid
+                )
+
+            if not valid_consents and not valid_subscriptions:
+                logger.warning(
+                    "[%s] All consents/subscriptions were skipped after validation | "
+                    "will still submit default purpose receipt",
+                    cid,
+                )
+                _log_skipped_summary(skipped_items, cid)
+
+        else:
+            logger.warning(
+                "[%s] No cs_consents or cs_subscriptions received | "
+                "will submit default purpose receipt only",
+                cid,
+            )
+
+        # ── 10. Build normal payloads ─────────────────
+        payloads_list = []
+        ot_uuid       = None
+
+        if valid_consents or valid_subscriptions:
+            payload["_valid_consents"]      = valid_consents
+            payload["_valid_subscriptions"] = valid_subscriptions
+
+            try:
+                route, payloads_list, ot_uuid = await build_consent_payload(
+                    payload, request_info, skipped_items, country_code, cid
+                )
+                logger.info("[%s] Payload built | route='%s' | total_receipts=%d",
+                            cid, route, len(payloads_list))
+            except ValueError as e:
+                logger.error("[%s] Payload build validation error | %s", cid, str(e))
+                _log_api_summary(call_counts, cid)
+                _log_skipped_summary(skipped_items, cid)
+                return _build_response(400, {"message": str(e)})
+            except Exception as e:
+                logger.error("[%s] Payload build failed | stage=BUILD_PAYLOAD | %s", cid, str(e))
+                _log_api_summary(call_counts, cid)
+                _log_skipped_summary(skipped_items, cid)
+                await send_to_dlq(original_event, str(e), "BUILD_PAYLOAD")
+                return _build_response(500, {"message": "Could not build the consent payload. Please check the request data and try again."})
+
+        # ── 11. Generate OT UUID if not yet set ───────
+        # (only happens when no valid consents/subs — build_consent_payload
+        #  generates it internally when the normal path runs)
+        if not ot_uuid:
+            ot_uuid = f"OT_{uuid.uuid4()}"
+            logger.info("[%s] Generated OT UUID (default purpose only path): %s", cid, ot_uuid)
+
+        # ── 12. Always append default purpose receipt ─
+        try:
+            default_payload = await _build_default_purpose_payload(
+                payload, request_info, country_code, cs_country, ot_uuid, cid
+            )
+            payloads_list.append(default_payload)
+            logger.info(
+                "[%s] Default purpose receipt appended | ot_uuid='%s' | total_receipts=%d",
+                cid, ot_uuid, len(payloads_list),
+            )
+        except RuntimeError as e:
+            logger.error(
+                "[%s] Failed to build default purpose payload | stage=BUILD_DEFAULT_PAYLOAD | %s",
+                cid, str(e),
+            )
+            _log_api_summary(call_counts, cid)
+            _log_skipped_summary(skipped_items, cid)
+            await send_to_dlq(original_event, str(e), "BUILD_DEFAULT_PAYLOAD")
+            return _build_response(500, {
+                "message": "Could not build the default consent payload. Please try again later."
+            })
+
+        # ── 13. Submit all receipts together ──────────
+        try:
+            submission_result = await _submit_all_payloads(
+                http_session, access_token, payloads_list, cid, call_counts
+            )
+        except Exception as e:
+            logger.error("[%s] Unexpected submission error | stage=CONSENT_SUBMISSION_UNEXPECTED | %s", cid, str(e))
+            _log_api_summary(call_counts, cid)
+            _log_skipped_summary(skipped_items, cid)
+            await send_to_dlq(original_event, str(e), "CONSENT_SUBMISSION_UNEXPECTED")
+            return _build_response(502, {"message": "Could not submit consent to OneTrust. Please try again later."})
+
+        if submission_result["all_failed"]:
+            failure_reason = (
+                f"All {submission_result['total']} consent receipt(s) failed to submit. "
+                f"Failed interaction dates: {[f['interaction_date'] for f in submission_result['failed']]}"
+            )
+            logger.error("[%s] All consent submissions failed | stage=CONSENT_SUBMISSION | %s",
+                         cid, failure_reason)
+            _log_api_summary(call_counts, cid)
+            _log_skipped_summary(skipped_items, cid)
+            await send_to_dlq(original_event, failure_reason, "CONSENT_SUBMISSION")
+            return _build_response(502, {"message": "Could not submit consent to OneTrust. Please try again later."})
+
+        if submission_result["submitted_count"] == 0:
+            logger.error("[%s] No receipts submitted", cid)
+            _log_api_summary(call_counts, cid)
+            _log_skipped_summary(skipped_items, cid)
+            return _build_response(400, {"message": _build_skipped_message(skipped_items)})
+
+        is_partial = submission_result["partial"]
+        if is_partial:
+            failed_dates   = [f["interaction_date"] for f in submission_result["failed"]]
+            failure_reason = (
+                f"Partial submission: {len(submission_result['failed'])}/"
+                f"{submission_result['total']} receipt(s) failed. "
+                f"Failed interaction dates: {failed_dates}"
+            )
+            logger.warning("[%s] [PARTIAL_SUBMISSION] %s | succeeded_dates=%s",
+                           cid, failure_reason,
+                           [s["interaction_date"] for s in submission_result["succeeded"]])
+            try:
+                partial_dlq_event = json.loads(json.dumps(original_event))
+            except (TypeError, ValueError):
+                partial_dlq_event = original_event.copy()
+            partial_dlq_event["_failed_interaction_dates"] = failed_dates
+            await send_to_dlq(partial_dlq_event, failure_reason, "CONSENT_SUBMISSION_PARTIAL")
+            logger.info("[%s] [PARTIAL_SUBMISSION] DLQ message queued | failed_dates=%s",
+                        cid, failed_dates)
+
+        # ── 14. Fetch created profile ─────────────────
+        try:
+            remaining_ms      = context.get_remaining_time_in_millis()
+            remaining_seconds = remaining_ms / 1000
+            max_retry_budget  = min(6.9, remaining_seconds * 0.6)
+            retry_delays_all  = [0.3, 0.6, 1.0, 2.0, 3.0]
+
+            retry_delays = []
+            cumulative = 0.0
+            for d in retry_delays_all:
+                if cumulative + d > max_retry_budget:
+                    break
+                retry_delays.append(d)
+                cumulative += d
+
+            if not retry_delays:
+                retry_delays = [min(0.3, max_retry_budget)]
+
+            logger.info(
+                "[%s] Profile fetch retry plan | attempts=%d | delays=%s | budget=%.1fs | remaining=%.1fs",
+                cid, len(retry_delays), retry_delays, max_retry_budget, remaining_seconds
+            )
+
+            data_subject = {}
+
+            for attempt, delay in enumerate(retry_delays, start=1):
+                logger.info(
+                    "[%s] Waiting %.1fs before fetching created profile | attempt=%d/%d",
+                    cid, delay, attempt, len(retry_delays)
+                )
+                await asyncio.sleep(delay)
+
+                try:
+                    fetched = await fetch_data_subject_by_uuid(
+                        http_session, access_token, ot_uuid, cid, call_counts
+                    )
+                except Exception as fetch_err:
+                    logger.warning(
+                        "[%s] Profile fetch attempt %d/%d raised error | %s",
+                        cid, attempt, len(retry_delays), str(fetch_err)
+                    )
+                    continue
+
+                if fetched:
+                    data_subject = fetched
+                    logger.info(
+                        "[%s] Profile fetched successfully on attempt %d/%d | uuid='%s'",
+                        cid, attempt, len(retry_delays), ot_uuid
+                    )
+                    break
+
+                logger.warning(
+                    "[%s] Profile not ready yet | attempt=%d/%d | uuid='%s' | will retry",
+                    cid, attempt, len(retry_delays), ot_uuid
+                )
+            else:
+                logger.error(
+                    "[%s] Profile not found after %d attempts | uuid='%s' | "
+                    "consent was recorded, profile may appear in OneTrust shortly",
+                    cid, len(retry_delays), ot_uuid
+                )
+                data_subject = {
+                    "warning": (
+                        "Profile was created and consent recorded, but the profile could not "
+                        "be retrieved after multiple attempts. It may appear in OneTrust shortly."
+                    )
+                }
+                await send_to_dlq(
+                    original_event,
+                    f"Profile not found after {len(retry_delays)} fetch attempts for UUID={ot_uuid}",
+                    "FETCH_CREATED_PROFILE_RETRY_EXHAUSTED"
+                )
+
+            logger.info("[%s] Created profile result: %s", cid, json.dumps(data_subject))
+
+        except Exception as e:
+            logger.error("[%s] Unexpected error during profile fetch | stage=FETCH_CREATED_PROFILE | %s",
+                         cid, str(e))
+            _log_api_summary(call_counts, cid)
+            _log_skipped_summary(skipped_items, cid)
+            await send_to_dlq(original_event, str(e), "FETCH_CREATED_PROFILE")
+            return _build_response(502, {
+                "message": "Consent was recorded but could not fetch the profile from OneTrust. Please try again later.",
+            })
+
+    # ── Final summaries ───────────────────────────────
+    _log_api_summary(call_counts, cid)
+    _log_skipped_summary(skipped_items, cid)
+
+    logger.info("[%s] Handler completed successfully | remaining_ms=%d",
+                cid, context.get_remaining_time_in_millis())
+
+    # ── Final response ────────────────────────────────
+    if is_partial:
+        failed_dates = [f["interaction_date"] for f in submission_result["failed"]]
+        logger.warning("[%s] Returning 207 Partial Content | succeeded=%d | failed=%d | failed_dates=%s",
+                       cid, submission_result["submitted_count"],
+                       len(submission_result["failed"]), failed_dates)
+        return _build_response(207, {
+            "message": (
+                f"Profile created with partial consent. "
+                f"{submission_result['submitted_count']}/{submission_result['total']} "
+                f"receipt(s) submitted successfully. "
+                f"{len(submission_result['failed'])} receipt(s) failed and have been queued for automatic retry."
+            ),
+            "profile": data_subject,
+        })
+
+    return _build_response(200, {
+        "message": "Profile created and consent recorded successfully in OneTrust.",
+        "profile": data_subject,
+    })
+
+
+# ======================================================
+# LAMBDA ENTRY POINT
+# ======================================================
+def lambda_handler(event, context):
+    remaining_ms      = context.get_remaining_time_in_millis()
+    remaining_seconds = remaining_ms / 1000 - 2
+    safe_timeout = max(remaining_seconds, 1.0)
+
+    logger.info(
+        "Lambda handler starting | remaining_ms=%d | wait_for_timeout=%.1fs",
+        remaining_ms, safe_timeout
+    )
+
+    try:
+        return asyncio.run(
+            asyncio.wait_for(
+                _async_handler(event, context),
+                timeout=safe_timeout
+            )
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "Lambda handler timed out | remaining_ms=%d",
+            context.get_remaining_time_in_millis()
+        )
+        return {
+            "isBase64Encoded": False,
+            "statusCode": 504,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"message": "Request timed out. Please try again later."}),
+        }
